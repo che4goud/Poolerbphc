@@ -1,0 +1,13 @@
+# Core app
+streamlit>=1.33,<2.0
+requests>=2.31.0,<3.0
+
+# Supabase (DB backend)
+supabase>=2.6.0,<3.0
+
+# Google OAuth (BITS email sign-in)
+google-auth>=2.29.0,<3.0
+google-auth-oauthlib>=1.2.0,<2.0
+
+# Auto-refresh toggle (optional but used in UI)
+streamlit-autorefresh>=1.0.1,<2.0
