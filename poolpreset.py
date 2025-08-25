@@ -1,12 +1,12 @@
 # app.py — BITS Hyderabad Pooler (Streamlit)
-# Stable build with:
+# Stable build (presets UI, no Maps required) with:
 # - Google Sign-In (restricted to @hyderabad.bits-pilani.ac.in)
 # - Supabase backend if configured, else SQLite fallback
 # - Create / join / leave / delete pools
-# - Distance sort using Google Places (no presets)
-# - Optional ±15 min time filter
+# - Members list visible to members/host
+# - Simple in-app chat for members (Supabase/SQLite)
 # - Live updates (auto-refresh) option
-# - Pickup field; require pickup when destination looks like an airport
+# - Pickup field; creator & members can leave; host delete hides card immediately
 # - Share links via URL query (?pool=...)
 # - Spam guard: 1 pool per user per 15 minutes
 # - Seats cap 1..10
@@ -54,6 +54,88 @@ except Exception:  # pragma: no cover
 # ---------------------------------
 st.set_page_config(page_title="BITS-H Pooler", page_icon="🚕", layout="wide")
 
+# --- UI polish (pure CSS; no functional changes) ---
+def inject_css():
+    st.markdown(
+        """
+        <style>
+        :root {
+          --bg: #0f1116;
+          --panel: #151823;
+          --muted: #9aa4b2;
+          --text: #e6e6e6;
+          --accent: #6366f1; /* indigo-500 */
+          --accent-2: #22c55e; /* green-500 */
+          --danger: #ef4444; /* red-500 */
+          --radius: 14px;
+        }
+        /* App background */
+        .stApp {
+          background: radial-gradient(1200px 600px at 0% -10%, #1a1f2e 0%, var(--bg) 35%), var(--bg);
+          color: var(--text);
+        }
+        /* Sidebar */
+        div[data-testid="stSidebar"] {
+          background: linear-gradient(180deg,#0d1020,#0c111a 60%);
+          border-right: 1px solid rgba(255,255,255,.06);
+        }
+        /* Containers & expanders */
+        .stExpander, .stTabs, .stAlert, .stTextInput, .stNumberInput, .stSelectbox, .stDateInput, .stTimeInput {
+          border-radius: var(--radius) !important;
+        }
+        .stExpander {
+          background: var(--panel);
+          border: 1px solid rgba(255,255,255,.06);
+        }
+        /* Inputs */
+        .stTextInput > div > div > input,
+        .stNumberInput input,
+        .stDateInput input,
+        .stTimeInput input {
+          background: #0f1320 !important;
+          color: var(--text) !important;
+          border: 1px solid rgba(255,255,255,.08) !important;
+          border-radius: 10px !important;
+        }
+        /* Selects */
+        div[data-baseweb="select"] > div { 
+          background: #0f1320 !important; 
+          color: var(--text) !important; 
+          border: 1px solid rgba(255,255,255,.08) !important; 
+          border-radius: 10px !important;
+        }
+        /* Buttons */
+        .stButton > button, .stLinkButton > a {
+          background: var(--accent) !important;
+          color: #fff !important;
+          border: 0 !important;
+          border-radius: 12px !important;
+          padding: .6rem 1rem !important;
+          box-shadow: 0 6px 20px rgba(99,102,241,.25) !important;
+        }
+        .stButton > button:hover, .stLinkButton > a:hover { filter: brightness(1.06); }
+        /* Danger button */
+        .stButton:has(button[kind="secondary"]) > button {
+          background: var(--danger) !important;
+          box-shadow: 0 6px 20px rgba(239,68,68,.25) !important;
+        }
+        /* Metrics as mini cards */
+        .stMetric {
+          background: var(--panel);
+          border: 1px solid rgba(255,255,255,.06);
+          border-radius: var(--radius);
+          padding: 10px 14px;
+        }
+        .stMetric label { color: var(--muted); }
+        /* Subheaders spacing */
+        .stMarkdown h2 { margin-top: 0.6rem; }
+        /* Share link input slightly dim */
+        .stTextInput input[readonly] { opacity: .9; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
 DB_PATH = Path("pools.db")
 COOLDOWN_MINUTES = 15
 SEATS_MIN, SEATS_MAX = 1, 10
@@ -65,7 +147,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/userinfo.profile",
 ]
 
-# Fixed preset list for dropdowns (no Maps API required)
+# Fixed preset list for destination/pickup dropdowns (no Maps API required)
 DEST_PICKUP_CHOICES = [
     "JBS",
     "Viceroy family dhaba",
@@ -100,9 +182,6 @@ DEST_PICKUP_CHOICES = [
     "Lakdi ka Pul",
 ]
 
-# Kept for compatibility in other parts of the codebase
-DESTINATIONS: List[Dict[str, Any]] = []
-
 # ---------------------------------
 # Utilities
 # ---------------------------------
@@ -124,49 +203,13 @@ def haversine_km(a: Dict[str, float], b: Dict[str, float]) -> float:
     if not a or not b:
         return float("inf")
     R = 6371.0
-    lat1, lon1 = math.radians(a["lat"]), math.radians(a["lng"])
-    lat2, lon2 = math.radians(b["lat"]), math.radians(b["lng"])
+    lat1, lon1 = math.radians(a["lat"]), math.radians(a["lng"]) if a else (0.0, 0.0)
+    lat2, lon2 = math.radians(b["lat"]), math.radians(b["lng"]) if b else (0.0, 0.0)
     dlat = lat2 - lat1
     dlon = lon2 - lon1
     x = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
     c = 2 * math.atan2(math.sqrt(x), math.sqrt(1 - x))
     return R * c
-
-
-def get_maps_cfg() -> Optional[str]:
-    try:
-        cfg = st.secrets.get("google_maps", {})
-        key = cfg.get("api_key")
-        return key
-    except Exception:
-        return None
-
-
-def google_places_search(query: str, key: str, limit: int = 5) -> List[Dict[str, Any]]:
-    if not requests or not key:
-        return []
-    try:
-        url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-        resp = requests.get(url, params={"query": query, "key": key}, timeout=8)
-        data = resp.json()
-        status = data.get("status", "UNKNOWN")
-        if status != "OK":
-            # Surface Google error so setup issues are obvious (e.g., key restrictions)
-            st.warning(f"Places API error: {status} {data.get('error_message', '')}")
-            return []
-        results = []
-        for r in data.get("results", [])[:limit]:
-            results.append({
-                "id": r.get("place_id"),
-                "name": r.get("name"),
-                "lat": r.get("geometry", {}).get("location", {}).get("lat"),
-                "lng": r.get("geometry", {}).get("location", {}).get("lng"),
-                "formatted_address": r.get("formatted_address"),
-            })
-        return results
-    except Exception as e:
-        st.warning(f"Places API request failed: {e}")
-        return []
 
 # ---------------------------------
 # Data layer (Supabase or SQLite)
@@ -200,7 +243,7 @@ def init_db():
             USE_SUPABASE = True
             return
         except Exception as e:
-            st.warning(f"Supabase disabled: {e}. Falling back to SQLite.")
+            st.sidebar.warning(f"Supabase disabled: {e}. Falling back to SQLite.")
             USE_SUPABASE = False
 
     # SQLite fallback schema
@@ -235,6 +278,19 @@ def init_db():
             )
             """
         )
+        # Chat messages (SQLite)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS messages (
+                id TEXT PRIMARY KEY,
+                pool_id TEXT,
+                sender_email TEXT,
+                sender_name TEXT,
+                content TEXT,
+                created_at TEXT
+            )
+            """
+        )
         con.commit()
 
 # Spam guard --------------------------------------------------------------
@@ -244,7 +300,14 @@ def can_host_create(email: str) -> bool:
     since = datetime.now() - timedelta(minutes=COOLDOWN_MINUTES)
     if USE_SUPABASE and SB is not None:
         try:
-            res = SB.table("pools").select("id,created_at").eq("host_email", email).gte("created_at", since.isoformat()).limit(1).execute()
+            res = (
+                SB.table("pools")
+                .select("id,created_at")
+                .eq("host_email", email)
+                .gte("created_at", since.isoformat())
+                .limit(1)
+                .execute()
+            )
             return not (res.data and len(res.data) > 0)
         except Exception:
             return True
@@ -293,9 +356,19 @@ def add_pool(pool: Dict[str, Any]):
         cur.execute(
             "INSERT INTO pools (id, destination_id, destination_name, lat, lng, when_iso, seats, mode, notes, host_name, host_email, created_at, pickup) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                pool["id"], pool["destination_id"], pool["destination_name"], pool["lat"], pool["lng"],
-                pool["when_iso"], pool["seats"], pool["mode"], pool["notes"], pool["host_name"],
-                pool["host_email"], pool["created_at"], pool.get("pickup", ""),
+                pool["id"],
+                pool["destination_id"],
+                pool["destination_name"],
+                pool["lat"],
+                pool["lng"],
+                pool["when_iso"],
+                pool["seats"],
+                pool["mode"],
+                pool["notes"],
+                pool["host_name"],
+                pool["host_email"],
+                pool["created_at"],
+                pool.get("pickup", ""),
             ),
         )
         cur.execute("INSERT OR IGNORE INTO members VALUES (?, ?, ?)", (pool["id"], pool["host_name"], pool["host_email"]))
@@ -327,9 +400,18 @@ def list_future_pools() -> List[Dict[str, Any]]:
         pools: List[Dict[str, Any]] = []
         for r in rows:
             p = {
-                "id": r[0], "destination_id": r[1], "destination_name": r[2], "lat": r[3], "lng": r[4],
-                "when_iso": r[5], "seats": r[6], "mode": r[7], "notes": r[8],
-                "host_name": r[9], "host_email": r[10], "created_at": r[11],
+                "id": r[0],
+                "destination_id": r[1],
+                "destination_name": r[2],
+                "lat": r[3],
+                "lng": r[4],
+                "when_iso": r[5],
+                "seats": r[6],
+                "mode": r[7],
+                "notes": r[8],
+                "host_name": r[9],
+                "host_email": r[10],
+                "created_at": r[11],
                 "pickup": r[12] if len(r) > 12 else "",
             }
             try:
@@ -343,6 +425,19 @@ def list_future_pools() -> List[Dict[str, Any]]:
         return pools
 
 
+def get_member_list(pool_id: str) -> List[Dict[str, str]]:
+    if USE_SUPABASE and SB is not None:
+        try:
+            res = SB.table("members").select("name,email").eq("pool_id", pool_id).order("joined_at", desc=False).execute()
+            return res.data or []
+        except Exception:
+            return []
+    with get_conn() as con:
+        cur = con.cursor()
+        cur.execute("SELECT name, email FROM members WHERE pool_id = ?", (pool_id,))
+        return [{"name": n, "email": e} for (n, e) in cur.fetchall()]
+
+
 def get_members_count(pool_id: str) -> int:
     if USE_SUPABASE and SB is not None:
         res = SB.table("members").select("pool_id").eq("pool_id", pool_id).execute()
@@ -354,7 +449,6 @@ def get_members_count(pool_id: str) -> int:
 
 
 def is_user_member(pool_id: str, email: str) -> bool:
-    """Return True if the given user currently appears in the members table for this pool."""
     if USE_SUPABASE and SB is not None:
         try:
             res = SB.table("members").select("pool_id").eq("pool_id", pool_id).eq("email", email).execute()
@@ -422,9 +516,25 @@ def join_pool(pool_id: str, name: str, email: str):
 
 
 def leave_pool(pool_id: str, email: str):
+    """Remove the user from a pool's members list.
+    With Supabase+RLS, prefer a SECURITY DEFINER RPC (leave_pool_if_member).
+    Falls back to direct delete for SQLite or if RPC is missing.
+    """
     if USE_SUPABASE and SB is not None:
-        SB.table("members").delete().eq("pool_id", pool_id).eq("email", email).execute()
-        return
+        # Try RPC first (works even when RLS blocks direct deletes)
+        try:
+            SB.rpc("leave_pool_if_member", {"p_pool_id": pool_id, "p_email": email}).execute()
+            return
+        except Exception:
+            pass
+        # Fallback: direct delete (requires an explicit delete policy if you use RLS)
+        try:
+            SB.table("members").delete().eq("pool_id", pool_id).eq("email", email).execute()
+            return
+        except Exception:
+            return
+
+    # SQLite fallback
     with get_conn() as con:
         cur = con.cursor()
         cur.execute("DELETE FROM members WHERE pool_id = ? AND email = ?", (pool_id, email))
@@ -437,24 +547,21 @@ def delete_pool(pool_id: str, requester_email: str) -> bool:
     SQLite: direct deletes.
     """
     if USE_SUPABASE and SB is not None:
-        # 1) Try RPC first (recommended). It should return true/false.
+        # 1) Try RPC first (recommended)
         try:
             rpc = SB.rpc("delete_pool_if_host", {"p_pool_id": pool_id, "p_email": requester_email}).execute()
             if isinstance(rpc.data, bool):
                 return rpc.data
-            # Some drivers return a list/record; treat any truthy value as success
             if rpc.data:
                 return True
         except Exception:
             pass
-        # 2) Fallback: allow only if our pre-check confirms host, then attempt direct delete
+        # 2) Fallback pre-check + direct delete (may be blocked by RLS)
         try:
             res = SB.table("pools").select("host_email").eq("id", pool_id).execute()
             if not res.data or res.data[0].get("host_email") != requester_email:
                 return False
-            # Attempt direct delete (will still be blocked by RLS unless you added a matching delete policy)
             dres = SB.table("pools").delete().eq("id", pool_id).execute()
-            # PostgREST returns [] when nothing deleted; treat non-empty as success
             return bool(getattr(dres, "data", None))
         except Exception:
             return False
@@ -470,26 +577,25 @@ def delete_pool(pool_id: str, requester_email: str) -> bool:
         cur.execute("DELETE FROM pools WHERE id = ?", (pool_id,))
         con.commit()
         return True
-    with get_conn() as con:
-        cur = con.cursor()
-        cur.execute("SELECT host_email FROM pools WHERE id = ?", (pool_id,))
-        row = cur.fetchone()
-        if not row or row[0] != requester_email:
-            return False
-        cur.execute("DELETE FROM members WHERE pool_id = ?", (pool_id,))
-        cur.execute("DELETE FROM pools WHERE id = ?", (pool_id,))
-        con.commit()
-        return True
 
 
 def cleanup_expired_pools():
+    """Remove pools with past departure times and their members.
+    Works for both Supabase and SQLite backends.
+    """
     if USE_SUPABASE and SB is not None:
         now_s = now_iso()
-        old_ids = [p.get("id") for p in (SB.table("pools").select("id").lt("when_iso", now_s).execute().data or [])]
-        if old_ids:
-            SB.table("members").delete().in_("pool_id", old_ids).execute()
-            SB.table("pools").delete().in_("id", old_ids).execute()
+        try:
+            old = SB.table("pools").select("id").lt("when_iso", now_s).execute()
+            ids = [p.get("id") for p in (old.data or []) if p.get("id")]
+            if ids:
+                SB.table("members").delete().in_("pool_id", ids).execute()
+                SB.table("pools").delete().in_("id", ids).execute()
+        except Exception:
+            # Ignore cleanup failures; UI will still function
+            pass
         return
+
     now = datetime.now()
     with get_conn() as con:
         cur = con.cursor()
@@ -501,6 +607,69 @@ def cleanup_expired_pools():
                     cur.execute("DELETE FROM pools WHERE id = ?", (pid,))
             except Exception:
                 continue
+        con.commit()
+
+# -----------------------
+# Chat (messages) helpers
+# -----------------------
+
+def list_messages(pool_id: str, limit: int = 200) -> List[Dict[str, Any]]:
+    if USE_SUPABASE and SB is not None:
+        try:
+            res = (
+                SB.table("messages")
+                .select("id,pool_id,sender_email,sender_name,content,created_at")
+                .eq("pool_id", pool_id)
+                .order("created_at", desc=False)
+                .limit(limit)
+                .execute()
+            )
+            return res.data or []
+        except Exception:
+            return []
+    with get_conn() as con:
+        cur = con.cursor()
+        cur.execute(
+            "SELECT id,pool_id,sender_email,sender_name,content,created_at FROM messages WHERE pool_id = ? ORDER BY created_at ASC LIMIT ?",
+            (pool_id, limit),
+        )
+        rows = cur.fetchall()
+        return [
+            {
+                "id": r[0],
+                "pool_id": r[1],
+                "sender_email": r[2],
+                "sender_name": r[3],
+                "content": r[4],
+                "created_at": r[5],
+            }
+            for r in rows
+        ]
+
+
+def add_message(pool_id: str, sender_name: str, sender_email: str, content: str):
+    ts = now_iso()
+    if USE_SUPABASE and SB is not None:
+        try:
+            SB.table("messages").insert(
+                {
+                    "pool_id": pool_id,
+                    "sender_email": sender_email,
+                    "sender_name": sender_name,
+                    "content": content,
+                    "created_at": ts,
+                }
+            ).execute()
+            return
+        except Exception:
+            return
+    with get_conn() as con:
+        cur = con.cursor()
+        mid = f"msg_{int(datetime.now().timestamp()*1000)}"
+        cur.execute(
+            "INSERT INTO messages (id,pool_id,sender_email,sender_name,content,created_at) VALUES (?,?,?,?,?,?)",
+            (mid, pool_id, sender_email, sender_name, content, ts),
+        )
         con.commit()
 
 # ---------------------------------
@@ -622,11 +791,10 @@ def email_gate():
         st.sidebar.error("Google Sign-In is not configured. Add [google_oauth] in secrets.")
 
 
-# Create Pool UI (Google Places only) ------------------------------------
+# Create Pool UI (presets only) -----------------------------------------
 
 def create_pool_ui(user: Dict[str, str]):
     with st.expander("➕ Create your own pool", expanded=False):
-        # Destination dropdown (fixed list)
         dest_name = st.selectbox("Destination", DEST_PICKUP_CHOICES, index=0)
         dest = {"id": _slug(dest_name), "name": dest_name, "lat": 0.0, "lng": 0.0}
 
@@ -706,47 +874,41 @@ def pools_list_ui(user: Dict[str, str]):
     if _prune:
         pools = [p for p in pools if p.get("id") != _prune]
 
-    # Optional time filter (±15 min)
-    enable_time_filter = st.checkbox("Enable time filter (±15 min)", value=False)
-    target_dt = None
-    if enable_time_filter:
-        _d = st.date_input("Date", value=datetime.now().date())
-        _t = st.time_input("Time", value=datetime.now().time().replace(second=0, microsecond=0))
-        target_dt = datetime.combine(_d, _t)
-
-    # Google Places search for sorting by distance
+    # Destination & pickup filters (dropdowns)
     st.subheader("Find pools by destination")
-    maps_key = get_maps_cfg()
-    target: Optional[Dict[str, float]] = None
-    q = st.text_input("Search a destination to sort by distance", key="list_search")
-    if maps_key and q.strip() and st.button("Search", key="list_search_btn"):
-        st.session_state["list_results"] = google_places_search(q.strip(), maps_key)
-    results = st.session_state.get("list_results", [])
-    if results:
-        labels = [f"{r['name']} – {r.get('formatted_address','')}" for r in results]
-        idx = st.selectbox("Pick a result", list(range(len(results))), format_func=lambda i: labels[i], key="list_pick")
-        if isinstance(idx, int) and 0 <= idx < len(results):
-            r = results[idx]
-            target = {"lat": r["lat"], "lng": r["lng"]}
+    dest_choice = st.selectbox(
+        "Filter by destination",
+        ["All destinations"] + DEST_PICKUP_CHOICES,
+        index=0,
+        key="dest_filter",
+    )
+    if dest_choice != "All destinations":
+        pools = [
+            p for p in pools
+            if (p.get("destination_name") or "").strip().lower() == dest_choice.strip().lower()
+        ]
 
-    # If focus from share, bring it to top
+    pickup_choice = st.selectbox(
+        "Optional: filter by pickup point",
+        ["Any pickup"] + DEST_PICKUP_CHOICES,
+        index=0,
+        key="pickup_filter",
+    )
+    if pickup_choice != "Any pickup":
+        pools = [
+            p for p in pools
+            if (p.get("pickup") or "").strip().lower() == pickup_choice.strip().lower()
+        ]
+
+    # Bring shared pool to top
     focus_pool = None
     if focus_id:
         focus_pool = next((p for p in pools if p.get("id") == focus_id), None)
         if focus_pool:
             pools = [focus_pool] + [p for p in pools if p.get("id") != focus_pool.get("id")]
 
-    # Apply time filter
-    if enable_time_filter and target_dt:
-        pools = [p for p in pools if abs((datetime.fromisoformat(p["when_iso"]) - target_dt).total_seconds()) <= 900]
-
-    # Distance sorting if a target place selected
-    if target is not None:
-        for p in pools:
-            p["distance_km"] = haversine_km(target, {"lat": p["lat"], "lng": p["lng"]})
-        pools.sort(key=lambda x: x.get("distance_km", float("inf")))
-    else:
-        pools.sort(key=lambda x: x["when_iso"])  # fallback: chronological
+    # Sort by time (chronological)
+    pools.sort(key=lambda x: x["when_iso"])
 
     st.subheader("Available Pools")
     if not pools:
@@ -754,12 +916,13 @@ def pools_list_ui(user: Dict[str, str]):
         return
 
     for p in pools:
+        pid = p.get("id")
         cols = st.columns([5, 2, 2, 3])
         with cols[0]:
             title_lines = [f"**{p['destination_name']}**"]
-            if focus_id and p.get("id") == focus_id:
+            if focus_id and pid == focus_id:
                 title_lines.append(":link: _Linked from share_")
-            st.markdown("  \n".join(title_lines))
+            st.markdown("  /n".join(title_lines))
 
             dt_str = datetime.fromisoformat(p["when_iso"]).strftime("%d %b %Y, %I:%M %p")
             st.caption(f"{dt_str} • {p['mode']}")
@@ -769,63 +932,93 @@ def pools_list_ui(user: Dict[str, str]):
             if p.get("notes"):
                 st.write(p["notes"])
         with cols[1]:
-            member_count = get_members_count(p.get("id"))
+            member_count = get_members_count(pid)
             st.metric("Members", f"{member_count}/{p['seats']}")
         with cols[2]:
-            if "distance_km" in p:
-                st.metric("Distance", f"{p['distance_km']:.1f} km")
+            st.empty()  # reserved column (distance removed in presets build)
         with cols[3]:
-            cur_count = get_members_count(p.get("id"))
-            already = is_user_member(p.get("id"), user["email"])
-            if already:
-                if st.button("Leave", key=f"leave_{p.get('id')}"):
-                    leave_pool(p.get("id"), user["email"])
+            cur_count = get_members_count(pid)
+            already = is_user_member(pid, user["email"]) or (p.get("host_email") == user["email"])  # host can always see
+            if is_user_member(pid, user["email"]):
+                if st.button("Leave", key=f"leave_{pid}"):
+                    leave_pool(pid, user["email"])
+                    st.success("You left the pool.")
                     st.rerun()
             elif cur_count < p["seats"]:
-                if st.button("Join", key=f"join_{p.get('id')}"):
-                    ok, msg = join_pool(p.get("id"), user["name"], user["email"])
+                if st.button("Join", key=f"join_{pid}"):
+                    ok, msg = join_pool(pid, user["name"], user["email"])
                     if ok:
                         st.success("Joined!")
                     else:
                         st.warning(msg)
                     st.rerun()
             else:
-                st.button("Full", disabled=True, key=f"full_{p.get('id')}")
+                st.button("Full", disabled=True, key=f"full_{pid}")
 
-            if st.button("Share link", key=f"share_{p.get('id')}"):
+            if st.button("Share link", key=f"share_{pid}"):
                 try:
-                    st.query_params["pool"] = p.get("id")
+                    st.query_params["pool"] = pid
                 except Exception:
                     pass
                 st.info("Link set in your address bar; copy & share.")
-                st.text_input("Share this", value=f"?pool={p.get('id')}", key=f"link_{p.get('id')}")
+                st.text_input("Share this", value=f"?pool={pid}", key=f"link_{pid}")
 
             if p.get("host_email") == user["email"]:
-                if st.button("Delete", key=f"del_{p.get('id')}"):
-                    ok = delete_pool(p.get("id"), user["email"])
+                if st.button("Delete", key=f"del_{pid}"):
+                    ok = delete_pool(pid, user["email"])
                     if ok:
-                        # remove from UI immediately and refresh
-                        st.session_state["_deleted_pool_id"] = p.get("id")
+                        st.success("Deleted")
+                        st.session_state["_deleted_pool_id"] = pid
                         st.rerun()
                     else:
                         st.warning("You can't delete this pool.")
+
+        # --- Members & Chat (visible to members/host only) ---
+        if already:
+            with st.expander(f"👥 Members ({get_members_count(pid)}/{p['seats']})", expanded=False):
+                mlist = get_member_list(pid)
+                if not mlist:
+                    st.caption("No members yet.")
+                else:
+                    for m in mlist:
+                        st.write(f"• {m.get('name','')} ({m.get('email','')})")
+
+            with st.expander("💬 Chat (beta)", expanded=False):
+                # Faster refresh for chat if live mode on
+                if live and st_autorefresh is not None:
+                    st_autorefresh(interval=3000, key=f"chat_refresh_{pid}")
+
+                msgs = list_messages(pid)
+                if msgs:
+                    for msg in msgs[-200:]:
+                        who = msg.get("sender_name") or msg.get("sender_email")
+                        when = msg.get("created_at", "")
+                        st.markdown(f"**{who}**  _{when}_  \n{msg.get('content', '')}")
+                else:
+                    st.caption("No messages yet. Start the conversation!")
+
+                with st.form(f"chat_send_{pid}", clear_on_submit=True):
+                    text = st.text_input("Message", placeholder="Type and press Send…")
+                    sent = st.form_submit_button("Send")
+                if sent and text.strip():
+                    add_message(pid, user["name"], user["email"], text.strip())
+                    st.rerun()
 
 # ---------------------------------
 # App entry
 # ---------------------------------
 
 def main():
+    # Inject CSS-only styling (no functional changes)
+    inject_css()
     init_db()
     if "user" not in st.session_state:
         st.session_state.user = None
 
-    # Only show Google Login in the sidebar when the user is NOT signed in
     user = st.session_state.user
     if not user:
         email_gate()
         st.stop()
-
-    # No extra sidebar UI after login (as requested)
 
     create_pool_ui(user)
     pools_list_ui(user)
@@ -833,4 +1026,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
