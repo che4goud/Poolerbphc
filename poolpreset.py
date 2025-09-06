@@ -851,13 +851,9 @@ def create_pool_ui(user: Dict[str, str]):
 def pools_list_ui(user: Dict[str, str]):
     cleanup_expired_pools()
     hero()
-
-    # Live updates via auto-refresh (fallback-friendly)
-    live = st.checkbox("🔄 Live updates (every 5s)", value=False)
-    if live and st_autorefresh is not None:
-        st_autorefresh(interval=5000, key="live_refresh")
-
-    # Shared link focus (?pool=...)
+    # Live updates removed
+    live = False  # kept as a placeholder to avoid NameError in older blocks
+# Shared link focus (?pool=...)
     qp = st.query_params
     focus_id: Optional[str] = None
     vals = qp.get("pool")
@@ -900,6 +896,36 @@ def pools_list_ui(user: Dict[str, str]):
             if (p.get("pickup") or "").strip().lower() == pickup_choice.strip().lower()
         ]
 
+    # ---- NEW: Optional Date & Time window filter (works with pickup/destination) ----
+    st.subheader("Time window (optional)")
+    enable_dt = False  # time window filter removed
+    if enable_dt:
+        fcol1, fcol2 = st.columns(2)
+        with fcol1:
+            day = st.date_input("Date", value=datetime.now().date(), key="flt_date")
+        with fcol2:
+            t1 = st.time_input("Start time", value=datetime.now().time().replace(second=0, microsecond=0), key="flt_t1")
+            t2 = st.time_input("End time", value=(datetime.now()+timedelta(hours=2)).time().replace(second=0, microsecond=0), key="flt_t2")
+        start_dt = datetime.combine(day, t1)
+        end_dt = datetime.combine(day, t2)
+        if end_dt < start_dt:
+            start_dt, end_dt = end_dt, start_dt
+        def _within_window(p):
+            try:
+                dt = datetime.fromisoformat(p["when_iso"])  # stored as ISO string
+                return start_dt <= dt <= end_dt
+            except Exception:
+                return False
+        pools = [p for p in pools if _within_window(p)]
+    # Date-only filter (replaces previous time window)
+    date_filter_on = st.checkbox("Filter by date", value=False, key="date_filter_only")
+    if date_filter_on:
+        date_pick = st.date_input("On date", value=datetime.now().date(), key="date_filter_only_date")
+        try:
+            pools = [p for p in pools if datetime.fromisoformat(p["when_iso"]).date() == date_pick]
+        except Exception:
+            pass
+
     # Bring shared pool to top
     focus_pool = None
     if focus_id:
@@ -922,7 +948,7 @@ def pools_list_ui(user: Dict[str, str]):
             title_lines = [f"**{p['destination_name']}**"]
             if focus_id and pid == focus_id:
                 title_lines.append(":link: _Linked from share_")
-            st.markdown("  /n".join(title_lines))
+            st.markdown("  \n".join(title_lines))
 
             dt_str = datetime.fromisoformat(p["when_iso"]).strftime("%d %b %Y, %I:%M %p")
             st.caption(f"{dt_str} • {p['mode']}")
@@ -930,7 +956,7 @@ def pools_list_ui(user: Dict[str, str]):
             if p.get("pickup"):
                 st.caption(f"Pickup: {p['pickup']}")
             if p.get("notes"):
-                st.write(p["notes"])
+                st.write(p["notes"]) 
         with cols[1]:
             member_count = get_members_count(pid)
             st.metric("Members", f"{member_count}/{p['seats']}")
@@ -984,10 +1010,8 @@ def pools_list_ui(user: Dict[str, str]):
                         st.write(f"• {m.get('name','')} ({m.get('email','')})")
 
             with st.expander("💬 Chat (beta)", expanded=False):
-                # Faster refresh for chat if live mode on
-                if live and st_autorefresh is not None:
-                    st_autorefresh(interval=3000, key=f"chat_refresh_{pid}")
-
+               # Chat auto-refresh removed; keeping block non-empty to avoid IndentationError
+                # Chat auto-refresh removed
                 msgs = list_messages(pid)
                 if msgs:
                     for msg in msgs[-200:]:
